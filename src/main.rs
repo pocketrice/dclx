@@ -1,8 +1,8 @@
-use std::arch::asm;
-use std::fs::{read, read_link, File};
-use std::io::{BufReader, Read};
-use std::ops::Deref;
 use csv::Reader;
+use std::fmt::Display;
+use std::fs::File;
+use std::io::Read;
+use std::ops::Deref;
 
 // ### GOAL ###
 // Determine (A) date gaps, (B) per-date hour gaps.
@@ -14,8 +14,7 @@ struct Row {
     hr: f32
 }
 
-#[derive(Default)]
-#[derive(Debug)]
+#[derive(Default, Debug)]
 struct UTime {
     year: u16,
     month: u8,
@@ -69,15 +68,34 @@ impl UTime {
     }
 
     pub fn from_unix(unix_stamp: u64) -> Self {
-        
+        let year = 1970 + (unix_stamp / 525600) as u16;
+
+        let mut raw = unix_stamp % 525600;
+        let mut month = 1;
+        while raw > 28 * 1440 {
+            raw -= mm2dd(month) as u64 * 1440;
+            month += 1;
+        }
+
+        let day = (1 + raw / 1440) as u8;
+        let dh_since = (raw % 1440) as u16;
+
+        Self { year, month, day, dh_since }
     }
 
-    pub fn to_unix(&self) -> u64 {
-
+    pub fn to_unix(&self) -> u64 { // "Unix minutes"
+        (self.year - 1970) as u64 * 525600 + ((1..self.month).fold(0u64, |acc, mm| acc + mm2dd(mm) as u64) + self.day as u64 - 1) * 1440 + (self.dh_since as u64)
     }
 
-    pub fn diff(&self, other: UTime) -> UTime {
+    pub fn diff(&self, other: &UTime) -> UTime {
+        Self::from_unix(self.to_unix() - other.to_unix())
+    }
+}
 
+impl Display for UTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let str = format!("{:?}/{:?}/{:?} {:02}:{:02}", self.month, self.day, self.year - 1970, self.dh_since / 60, self.dh_since % 60);
+        write!(f, "{}", str) // TODO year seemingly becomes 3990?
     }
 }
 
@@ -91,10 +109,12 @@ fn main() {
         rows.push(row);
     }
 
-    let (splits, counts) = validate_chunking(&rows);
+    let (splits, _) = validate_chunking(&rows);
     let times: Vec<UTime> = splits.iter().map(|s| UTime::from_hr(&rows.get((s-1) as usize).unwrap().time)).collect();
 
-    id_gaps(&times);
+    println!();
+    
+    id_gaps(&times, &splits);
 }
 
 /// Validate whether time column is chunked in 60s.
@@ -116,7 +136,7 @@ fn validate_chunking(csr: &Vec<Row>) -> (Vec<u64>, Vec<u8>) {
             counts.1.push(index.1);
 
             if index.1 != 60 {
-                println!("{:?} degenerate ({:?}/60 ▶▶ {:?})", curr, index.1, index.0);
+                println!("{:?} degenerate ({:?}/60 ▶▶ @{:?})", curr, index.1, index.0);
             }
 
             index.1 = 1;
@@ -127,13 +147,20 @@ fn validate_chunking(csr: &Vec<Row>) -> (Vec<u64>, Vec<u8>) {
     counts
 }
 
-fn id_gaps(times: &Vec<UTime>) {
-    times.windows(2)
-        .inspect(|)
+fn id_gaps(times: &Vec<UTime>, splits: &Vec<u64>) {
+    let mut spl_ind = 0; // TODO maybe replace .windows() with std counting for loop
+    for w in times.windows(2) {
+        spl_ind += 1;
+        let (w1, w2) = (w.first().unwrap(), w.last().unwrap());
+
+        if w2.diff(w1).to_unix() > 1 {
+            println!("\"{:} ⇢ {:}\" gap ✦ @{:?}", w1, w2, splits[spl_ind]);
+        }
+    }
 }
 
 pub(crate) fn mm2dd(mm: u8) -> u8 { // https://cmcenroe.me/2014/12/05/days-in-month-formula.html
-    28 + (mm + (mm / 8)) % 2 + (2 % mm) + 2 * (mm / 8)
+    28 + (mm + (mm / 8)) % 2 + (2 % mm) + 2 * (1 / mm)
 }
 
 #[cfg(test)]
@@ -157,9 +184,29 @@ mod tests {
     }
 
     #[test]
-    fn r_utime_unix() { // [r] obj test (rationale: alphabetically close)
-        let ut = UTime::from(34, 12, 8, 682);
-        assert_eq!(ut.to_unix(), 1102522920);
+    fn utime_4unix() {
+        let ut = UTime::from(34, 1, 1, 680);
+        let ut2 = UTime::from_unix(ut.to_unix());
+        assert_eq!(ut.diff(&ut2).to_unix(), 0);
     }
+
+    // #[test]
+    // fn utime_2unix_base() { // [struct_name] is-obj test
+    //     let ut = UTime::from(0, 1, 1, 300);
+    //     assert_eq!(ut.to_unix(), 18000);
+    // }
+    //
+    // #[test]
+    // fn utime_2unix_mmdd() {
+    //     let ut: UTime = UTime::from(0, 12, 8, 300);
+    //     assert_eq!(ut.to_unix(), 29480400);
+    // }
+    //
+    // #[test]
+    // fn utime_2unix_yymmdd() {
+    //     let ut: UTime = UTime::from(34, 6,12,240);
+    //     assert_eq!(ut.to_unix(), 1087012800);
+    // }
+
 }
 
