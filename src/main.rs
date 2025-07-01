@@ -113,7 +113,7 @@ fn main() {
     let times: Vec<UTime> = splits.iter().map(|s| UTime::from_hr(&rows.get((s-1) as usize).unwrap().time)).collect();
 
     println!();
-    
+
     id_gaps(&times, &splits);
 }
 
@@ -136,7 +136,7 @@ fn validate_chunking(csr: &Vec<Row>) -> (Vec<u64>, Vec<u8>) {
             counts.1.push(index.1);
 
             if index.1 != 60 {
-                println!("{:?} degenerate ({:?}/60 ▶▶ @{:?})", curr, index.1, index.0);
+                println!("{:?} bad ({:?}/60 ▶▶ @{:?})", curr, index.1, index.0);
             }
 
             index.1 = 1;
@@ -154,7 +154,7 @@ fn id_gaps(times: &Vec<UTime>, splits: &Vec<u64>) {
         let (w1, w2) = (w.first().unwrap(), w.last().unwrap());
 
         if w2.diff(w1).to_unix() > 1 {
-            println!("\"{:} ⇢ {:}\" gap ✦ @{:?}", w1, w2, splits[spl_ind]);
+            println!("\"{:} — {:}\" gap ▶▶ @{:?}", w1, w2, splits[spl_ind-1]);
         }
     }
 }
