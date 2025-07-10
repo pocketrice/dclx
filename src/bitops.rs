@@ -3,6 +3,7 @@ pub fn bits8(byte: u8) -> [u8; 8] { // big-endian (8-0)
 }
 
 pub fn bits16(num: u16) -> [u8; 16] {
+
     [(num >> 15 & 0x1) as u8, (num >> 14 & 0x1) as u8, (num >> 13 & 0x1) as u8, (num >> 12 & 0x1) as u8, (num >> 11 & 0x1) as u8, (num >> 10 & 0x1) as u8, (num >> 9 & 0x1) as u8, (num >> 8 & 0x1) as u8, (num >> 7 & 0x1) as u8, (num >> 6 & 0x1) as u8, (num >> 5 & 0x1) as u8, (num >> 4 & 0x1) as u8, (num >> 3 & 0x1) as u8, (num >> 2 & 0x1) as u8, (num >> 1 & 0x1) as u8, (num & 0x1) as u8]
 }
 
