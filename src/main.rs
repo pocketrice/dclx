@@ -3,19 +3,19 @@ extern crate core;
 mod bitops;
 mod irgex;
 
-use std::ascii::AsciiExt;
 use csv::{Reader, Writer};
 use intx::U24;
+use itertools::Itertools;
+use num_traits::Zero;
 use plotters::prelude::*;
+use serde::Serialize;
+use std::ascii::AsciiExt;
+use std::cmp::PartialEq;
 use std::fmt::Display;
 use std::fs::File;
 use std::io::{stdin, stdout, Read, Write};
-use std::ops::{Add, Deref};
+use std::ops::{Add, Deref, Range};
 use std::process::Command;
-use std::sync::Arc;
-use itertools::Itertools;
-use num_traits::Zero;
-use serde::Serialize;
 // ** GOAL **
 // Date gaps, per-date hour gaps, mem2visplot
 
@@ -23,15 +23,24 @@ use serde::Serialize;
 // IDEA - cctv-1
 
 const ASCII_RESIDUAL: u32 = 0x1CFD2; // <-- most optimal would be intx::from_be_bytes() but not a const function
-const IS_MODE_CONVERT: bool = false;
+const PROG_MODE: DclxMode = DclxMode::AppendTsepT2;
 const IS_LINE_ANNOTATED: bool = false;
-const PY_PATH: &str = "~/Documents/IntelliJ/RustRover/dclx/py/"; //"../py/";
+const NA: &'static str = "NA";
+const PY_PATH: &'static str = "~/Documents/IntelliJ/RustRover/dclx/py/"; //"../py/";
 
 enum GlycemicVariable {
     Generic,
     Dexcom,
     FoodLog,
     HeartRate
+}
+
+#[derive(Debug)]
+enum DclxMode {
+    FixT1,
+    RewriteTsepT2, // tsep = time separators
+    AppendTsepT2,
+    AnalyzeT2,
 }
 
 impl GlycemicVariable {
@@ -49,6 +58,12 @@ impl GlycemicVariable {
 struct Row {
     time: String,
     hr: f32
+}
+
+impl Row {
+    fn new(time: String, hr: f32) -> Row {
+        Row { time, hr }
+    }
 }
 
 #[derive(Default, Debug)]
@@ -169,7 +184,7 @@ impl UTime {
 
     /// Convert to human-readable time string.
     pub fn to_hrt(&self) -> String {
-        let (h, m, s) = self.segment();
+        let (_, _, _, h, m, s) = self.segment();
         let decons: [(u8, &str); 6] = [ ((self.year - 1970) as u8, "yr"), (self.month-1, "mo"), (self.day-1, "d"), (h, "h"), (m, "m"), (s, "s") ]; // <-- sadly (dyn Zero) or (dyn [custom UnInt=Display+Eq trait]) doesn't work since they're not dyn-compatible :c
 
         let mut hrt = String::new();
@@ -212,10 +227,10 @@ impl UTime {
         self
     }
 
-    /// Segment sec into hh:mm:ss.
-    pub fn segment(&self) -> (u8, u8, u8) {
+    /// Segment sec into YY:MM:DD:hh:mm:ss (akin to py's datetime::timetuple)
+    pub fn segment(&self) -> (u16, u8, u8, u8, u8, u8) {
         let m_sec = u32::from(self.sec);
-        ((m_sec / 3600) as u8, ((m_sec % 3600) / 60) as u8, (m_sec % 60) as u8)
+        (self.year, self.month, self.day, (m_sec / 3600) as u8, ((m_sec % 3600) / 60) as u8, (m_sec % 60) as u8)
     }
 
     /// Strip second segment from sec. Returns self for chaining.
@@ -228,7 +243,7 @@ impl UTime {
 
 impl Display for UTime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (h, m, s) = self.segment();
+        let (_, _, _, h, m, s) = self.segment();
 
         let str = format!("{:?}-{:02}-{:02} {:02}:{:02}:{:02}", self.year - 1970, self.month, self.day, h, m, s);
         write!(f, "{}", str) // TODO year seemingly becomes 3990?
@@ -244,49 +259,110 @@ impl Clone for UTime {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arg = std::env::args().skip(1).next();
 
+    println!("\n\n**********************************\n CURRENT MODE IS {:?} \n**********************************\n", PROG_MODE);
+
     // ▼ looks like black magic, but take a close peek
-    let file: String = if let Some(name) = arg { // tiny hint on if let — binding only valid for the true branch!
-       name
+    let (filename, var, dataset): (String, String, String) = if let Some(name) = arg { // tiny hint on if let — binding only valid for the true branch!
+       // contingent on matching [A-Za-z]+_[A-Za-z]{3}\.csv TODO throw a fit if not compliant
+        let segs = name.split_once('_').expect("Improper format");
+        (name.clone(), segs.0.to_string(), segs.1[..3].to_string())
     } else {
         let (mut s1, mut s2) = (String::new(), String::new());
         query(&mut s1, "Variable");
         query(&mut s2, "Dataset");
 
-        format!("data/{:03}/{}_{:03}.csv", s2.trim().parse::<u8>()?, s1.trim().to_ascii_uppercase(), s2.trim().parse::<u8>()?)
+        s2 = format!("{:03}", s2.trim().parse::<u8>()?);
+
+        (format!("data/{}/{}_{}.csv", s2, s1.trim().to_ascii_uppercase(), s2), s1, s2)
     };
 
     println!();
 
-    if IS_MODE_CONVERT {
-        convert_type1(file);
-    } else {
-        let mut data = File::options()
-            .read(true)
-            .write(true)
-            .open(file)?;
-        let mut csr = Reader::from_reader(&data);
-        //let mut csw = Writer::from_path("data/HR_001b.csv")?;
-        let mut rows: Vec<Row> = Vec::new();
+    let mut data = File::options()
+        .read(true)
+        .write(true)
+        .open(&filename)?;
 
-        for res in csr.records() {
-            let rec = res.expect("Bad record");
-            let row: Row = rec.deserialize(None).unwrap();
-            rows.push(row);
-        }
+    let mut csr = Reader::from_reader(&data);
+    let mut csw: Writer<File> = Writer::from_path(format!("{}.tmp", filename))?;
+    let mut rows: Vec<Row> = Vec::new();
 
-        //let is_kgf = &rows.first().unwrap().time.as_bytes()[4] == &0x2D; // Known Good Format; type 2 format
-
-        let (splits, _) = validate_chunking(&rows);
-        let times = splits.iter().map(|s| UTime::from_hr(&rows.get((s-1) as usize).unwrap().time)).collect();
-
-        println!();
-
-        let gaps = id_gaps(&times, &splits);
-        print!("{}", gaps.iter().take(5).map(|g| g.to_string()).join(";"));
+    for res in csr.records() {
+        let rec = res.expect("Bad record");
+        let row: Row = rec.deserialize(None).unwrap();
+        rows.push(row);
     }
 
+    let (splits, _) = validate_chunking(&rows); // <-- csv indices; RLE representation of times
+    let times = splits.iter().map(|s| UTime::from_hr(&rows.get(s-1).unwrap().time)).collect(); // <-- UTime; timestamp counterpart for splits
+    let mut gaps = id_gaps(&times, &splits); // <-- csv indices; low-adjacent to offending line, in other words [i, i+1] encapsulates the evil gap
 
+    println!();
 
+    match PROG_MODE {
+        DclxMode::FixT1 => {
+            csw.write_record(vec!["time", "hr"])?;
+
+            let mut curr: (String, u8) = (String::new(), 0);
+
+            for row in rows {
+                let mut rt = row.time.clone();
+
+                if curr.0.eq(&*rt) {
+                    curr.1 += 1;
+                } else {
+                    curr = (rt, 0u8);
+                }
+
+                let mut ut = UTime::from_hr(&row.time); // <-- note! do not append seconds yet, that doesn't fit Type 1 format.
+                ut.step(curr.1 as i64);
+
+                csw.serialize(Row { time: ut.to_string(), hr: row.hr }).expect("Failed to serialize row");
+            }
+        }
+
+        DclxMode::AnalyzeT2 => {
+            print!("{}", gaps.iter().take(5).map(|g| g.to_string()).join(";"));
+        }
+
+        DclxMode::RewriteTsepT2 | DclxMode::AppendTsepT2 => { // For sake of ease and scope assuming all accepted dates are within the same year. Most (all?)  of the data is set this way anyway and i'm not writing a datetime lib..
+            csw.write_record(vec!["day", "ts", "time", "hr"])?;
+
+            let ut_init = UTime::from_hr(&rows[0].time);
+            let day_marker = ut_init.day + cm2dd(ut_init.month) - 1; // start @ day 1
+
+            let is_mode_append = matches!(PROG_MODE, DclxMode::AppendTsepT2);
+
+            for (i, row) in rows.iter().enumerate() {
+                let ut_curr = UTime::from_hr(&row.time);
+                let (_, mm, dd, h, m, s) = ut_curr.segment();
+                let day_delta = (dd + cm2dd(mm)) - day_marker;
+
+                if is_mode_append && i == *gaps.first().unwrap_or(&0) {
+                    let gap = gaps.remove(0);
+                    println!("mending {}", gap);
+
+                    let ut_gap = (UTime::from_hr(&rows[gap-1].time), UTime::from_hr(&rows[gap].time));
+                    let diff = ut_gap.1.diff(&ut_gap.0).to_unix();
+
+                    for j in 1..diff { // <-- insert reverse order @ gap pos so no index recalc!
+                        let mut gap_clone = ut_gap.0.clone();
+                        let h = j as i64;
+                        let nu_time = gap_clone.step(j as i64);
+
+                        let (_, nmm, ndd, nh, nm, ns) = nu_time.segment();
+                        let nu_delta = (ndd + cm2dd(nmm)) - day_marker;
+
+                        csw.write_record(vec![&nu_delta.to_string(), &format!("{:02}:{:02}:{:02}", nh, nm, ns), &nu_time.to_string(), NA])?;
+                    }
+                }
+
+                csw.write_record(vec![&day_delta.to_string(), &format!("{:02}:{:02}:{:02}", h, m, s), &row.time, &row.hr.to_string()])?
+            }
+        }
+    }
+
+    println!("OK");
     Ok(())
 }
 
@@ -320,50 +396,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // fn analyze_data(dataset)... <-- not the best idea... too situational this is overeng
 
-/// Converts Type 1 data (e.g. HR_001) to Type 2 data.
-fn convert_type1(uri: String) {
-    let data = File::options()
-        .read(true)
-        .write(false)
-        .open(&uri).expect("Bad URI for Type 1 conversion");
-
-    let (mut csr, mut csw) = (Reader::from_reader(&data), Writer::from_path({
-        let mut uri_cpy = uri.clone();
-        uri_cpy.insert(uri.len()-4, 'b');
-        uri_cpy
-    }
-    ).expect("Unable to write to converted Type 2 URI"));
-
-    let mut curr: (String, u8) = (String::new(), 0u8);
-    for res in csr.records() {
-        let rec = res.expect("Bad record");
-        let mut row: Row = rec.deserialize(None).unwrap();
-        let mut rt = row.time.clone();
-
-        if curr.0.eq(&*rt) {
-            curr.1 += 1;
-        } else {
-            curr = (rt, 0u8);
-        }
-
-        let mut ut = UTime::from_hr(&row.time); // <-- note! do not append seconds yet, that doesn't fit Type 1 format.
-        ut.step(curr.1 as i64);
-
-        csw.serialize(Row { time: ut.to_string(), hr: row.hr }).expect("Failed to serialize row");
-    }
-}
-
 /// Indexed Run-Length Encode zipped data. This means retrieval still depends on
 ///  the original dataset.
 //fn irle_data(data: &Vec<Row>) -> (Vec<u64>, Vec<u8>) {}
 
 /// Validate whether time column is chunked in 60s. Returns (<splits>, <counts>).
 /// Standard thinking would be to generify this but as Abrash/grug alludes to test first, overengineer later.
-fn validate_chunking(csr: &Vec<Row>) -> (Vec<u64>, Vec<u8>) {
+fn validate_chunking(csr: &Vec<Row>) -> (Vec<usize>, Vec<u8>) {
     let mut iter = csr.iter();
-    let mut counts = (Vec::<u64>::new(), Vec::<u8>::new());
-    let mut index: (u64, u8) = (1, 0); // date index, count index
-    let mut curr: &String = &iter.next().unwrap().time;  // Prefer over loading/checking every previous
+    let mut counts = (Vec::<usize>::new(), Vec::<u8>::new());
+    let mut index: (usize, u8) = (1, 0); // date index, count index
+    let mut curr: &str = &iter.next().unwrap().time;  // Prefer over loading/checking every previous
 
     while let Some(row) = iter.next() {
         let time = &row.time;
@@ -371,7 +414,7 @@ fn validate_chunking(csr: &Vec<Row>) -> (Vec<u64>, Vec<u8>) {
         if time.chars().take(16).eq(curr.chars().take(16)) { // Type 2 has second terminator @ 16 ▼
             index.1 += 1;                                           // Just comparing first 16 characters guarantees only minutes retaining behavior for both Type 1 and 2 ✩
         } else {
-            index.0 += index.1 as u64;
+            index.0 += index.1 as usize;
             counts.0.push(index.0);
             counts.1.push(index.1);
 
@@ -388,8 +431,8 @@ fn validate_chunking(csr: &Vec<Row>) -> (Vec<u64>, Vec<u8>) {
 }
 
 /// Identify gaps within Type 1 dataset. Returns CSV row low-adjacent to offending line (e.g. [index, index+1] is gap)
-fn id_gaps(times: &Vec<UTime>, splits: &Vec<u64>) -> Vec<u64> {
-    let mut gaps = Vec::<u64>::new();
+fn id_gaps(times: &Vec<UTime>, splits: &Vec<usize>) -> Vec<usize> {
+    let mut gaps = Vec::<usize>::new();
     let mut spl_ind = 0; // TODO maybe replace .windows() with std counting for loop
 
     for w in times.windows(2) {
@@ -454,9 +497,16 @@ pub(crate) fn query(bfr: &mut String, msg: &str) {
 
 // pub(crate) fn query_til(bfr: &mut String, )
 
+// Single month to days (aka PDF?)
 pub(crate) fn mm2dd(mm: u8) -> u8 { // https://cmcenroe.me/2014/12/05/days-in-month-formula.html
     28 + (mm + (mm / 8)) % 2 + (2 % mm) + 2 * (1 / mm)
 }
+
+// Cumulative months to days (aka CDF?) TODO better naming please -n-
+pub(crate) fn cm2dd(until_mm: u8) -> u8 {
+    (1..until_mm).map(mm2dd).sum::<u8>()
+}
+
 //                                                          ▼ "borrow burrowing"... falling into a hole of borrowing. Best to learn how to
 //                                                          ▼                       outright manage this instead of turning a blind eye.
 /// (Brutal) macro for snipping string head into clone to avoid burrowing.
@@ -467,6 +517,11 @@ pub(crate) fn behead(str: &str, len: usize) -> String {
 /// Tail equivalent of behead.
 pub(crate) fn detail(str: &str, len: usize) -> String {
     str.clone()[..str.len()-len].to_string()
+}
+
+/// Offset a range by specified amount.
+pub(crate) fn offset_range<T: Add<Output = T> + Clone>(range: &Range<T>, offset: T) -> Range<T> {
+    Range { start: range.start.clone() + offset.clone(), end: range.end.clone() + offset }
 }
 
 
