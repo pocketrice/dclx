@@ -5,16 +5,12 @@ mod irgex;
 
 use csv::{Reader, Writer};
 use intx::U24;
-use itertools::Itertools;
-use num_traits::Zero;
-use plotters::prelude::*;
-use serde::Serialize;
-use std::ascii::AsciiExt;
 use std::cmp::PartialEq;
 use std::fmt::Display;
+use std::fs;
 use std::fs::File;
-use std::io::{stdin, stdout, Read, Write};
-use std::ops::{Add, Deref, Range};
+use std::io::{stdin, stdout, Write};
+use std::ops::{Add, Range};
 use std::process::Command;
 // ** GOAL **
 // Date gaps, per-date hour gaps, mem2visplot
@@ -23,7 +19,7 @@ use std::process::Command;
 // IDEA - cctv-1
 
 const ASCII_RESIDUAL: u32 = 0x1CFD2; // <-- most optimal would be intx::from_be_bytes() but not a const function
-const PROG_MODE: DclxMode = DclxMode::AppendTsepT2;
+const PROG_MODE: DclxMode = DclxMode::AnalyzeT2;
 const IS_LINE_ANNOTATED: bool = false;
 const NA: &'static str = "NA";
 const PY_PATH: &'static str = "~/Documents/IntelliJ/RustRover/dclx/py/"; //"../py/";
@@ -39,7 +35,7 @@ enum GlycemicVariable {
 enum DclxMode {
     FixT1,
     RewriteTsepT2, // tsep = time separators
-    AppendTsepT2,
+    RewriteAppendTsepT2,
     AnalyzeT2,
 }
 
@@ -54,7 +50,7 @@ impl GlycemicVariable {
     }
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
 struct Row {
     time: String,
     hr: f32
@@ -121,14 +117,14 @@ impl UTime {
             )
         } else {
             let hr_mod = {
-                let mut hr_clone = hr_time.clone().to_string();
+                let mut hr_clone = hr_time.to_string();
                 let cl_bytes = unsafe { hr_clone.as_bytes_mut() }; // <-- technically UTF-8 (1-4 var-width encoding) but @assume ASCII so 1 byte
                 for c in 0..cl_bytes.len() {
                     // Must be within 0x30-0x39... 0b110000-0b111001... must not be 0b111010-0b(1)000000-...
                     // Supposedly may be faster if short-circuit high nibble then check lower nibble.
                     // if (*b & 0xF0 == 0x30) && (*b & 0x0F < 0x0A) { <-- the more generic [^0-9]
 
-                    let mut b = cl_bytes[c];
+                    let b = cl_bytes[c];
 
                     // Only delimiters are 0x20 ( ), 0x2F (/), 0x3A (:). All contain bit 5 (0x20), though we
                     // can also ignore 0x20 since we'll keep it as the unified delimiter. This also conveniently
@@ -179,13 +175,16 @@ impl UTime {
 
     /// Convert to Unix timestamp (in seconds).
     pub fn to_unix(&self) -> u64 { // ...seconds
-        (self.year - 1970) as u64 * 31536000 + ((1..self.month).fold(0u64, |acc, ss| acc + mm2dd(ss) as u64 * 60) + self.day as u64 - 1) * 86400 + u64::from(self.sec)
+        (self.year - 1970) as u64 * 31536000 // 365d = 31536000s
+            + ((1..self.month).fold(0u64, |acc, ss| acc + mm2dd(ss) as u64) // 1d = 86400s
+            + self.day as u64 - 1) * 86400
+            + u64::from(self.sec)
     }
 
-    /// Convert to human-readable time string.
+    /// Convert to human-readable time string (e.g. 4yr12mo8d 8h3m52s)
     pub fn to_hrt(&self) -> String {
-        let (_, _, _, h, m, s) = self.segment();
-        let decons: [(u8, &str); 6] = [ ((self.year - 1970) as u8, "yr"), (self.month-1, "mo"), (self.day-1, "d"), (h, "h"), (m, "m"), (s, "s") ]; // <-- sadly (dyn Zero) or (dyn [custom UnInt=Display+Eq trait]) doesn't work since they're not dyn-compatible :c
+        let (yy, mm, dd, h, m, s) = self.segment();
+        let decons: [(u8, &str); 6] = [ ((yy - 1970) as u8, "yr"), (mm-1, "mo"), (dd-1, "d"), (h, "h"), (m, "m"), (s, "s") ]; // <-- sadly (dyn Zero) or (dyn [custom UnInt=Display+Eq trait]) doesn't work since they're not dyn-compatible :c
 
         let mut hrt = String::new();
         for (i, (n, label)) in decons.iter().enumerate() {
@@ -204,6 +203,12 @@ impl UTime {
         }
 
         hrt
+    }
+
+    /// Convert to parsable time string — for now excluding yy:mm:dd (e.g. 08:03:52)
+    pub fn to_prt(&self) -> String { // <-- wanted to call it parstr :< aaaaaaa curse u legibility!!!
+        let (_, _, _, h, m, s) = self.segment();
+        format!("{:02}:{:02}:{:02}", h, m, s)
     }
 
     /// Calculate the diff between times (positive-only) stored as UTime.
@@ -271,20 +276,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         query(&mut s1, "Variable");
         query(&mut s2, "Dataset");
 
+        s1 = s1.trim().to_ascii_uppercase();
         s2 = format!("{:03}", s2.trim().parse::<u8>()?);
 
-        (format!("data/{}/{}_{}.csv", s2, s1.trim().to_ascii_uppercase(), s2), s1, s2)
+        (format!("data/{}/{}_{}.csv", s2, s1, s2), s1, s2)
     };
 
     println!();
 
-    let mut data = File::options()
+    let data = File::options()
         .read(true)
         .write(true)
         .open(&filename)?;
 
     let mut csr = Reader::from_reader(&data);
-    let mut csw: Writer<File> = Writer::from_path(format!("{}.tmp", filename))?;
+    let mut csw: Writer<File> = {
+        let w_path = format!("{}.tmp", filename);
+        if fs::exists(w_path).is_ok() {
+            println!("!!! warning: rewriting existing .tmp\n");
+        }
+
+        Writer::from_path(format!("{}.tmp", filename))?
+    };
+
     let mut rows: Vec<Row> = Vec::new();
 
     for res in csr.records() {
@@ -301,12 +315,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match PROG_MODE {
         DclxMode::FixT1 => {
-            csw.write_record(vec!["time", "hr"])?;
+           // csw.write_record(vec!["time", "hr"])?; <-- seems to be already written?!
 
             let mut curr: (String, u8) = (String::new(), 0);
 
             for row in rows {
-                let mut rt = row.time.clone();
+                let rt = row.time.clone();
 
                 if curr.0.eq(&*rt) {
                     curr.1 += 1;
@@ -317,21 +331,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut ut = UTime::from_hr(&row.time); // <-- note! do not append seconds yet, that doesn't fit Type 1 format.
                 ut.step(curr.1 as i64);
 
+
+
                 csw.serialize(Row { time: ut.to_string(), hr: row.hr }).expect("Failed to serialize row");
             }
         }
 
         DclxMode::AnalyzeT2 => {
-            print!("{}", gaps.iter().take(5).map(|g| g.to_string()).join(";"));
+            // 08/12/25 change: HR_001.csv -> HR_001-log.csv
+            // format:                                                  indices in "filled" (rewrite/appended) csv (b/c normal would just be i and i+1)
+            //                                                       -------------------
+            //                                                       |                 |                                                   prefer parsable time over human-readable
+            //                                                       v                 v                                                    v
+            // ----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+            // |       time_start      |        time_end        |   ind_f_start   |    ind_f_end    |    hr_start    |    hr_end    |     gap_time    |    gap_len    |    ind_s    |  <-- index in "standard" (lower bound)
+            // ----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+            // |  2020-12-08 15:29:03  |  2020-12-08 19:49:00   |      192240     |      223923     |       92       |      104     |     08:48:03    |     31683     |    172303   |
+            // /                       /                        /                 /                 /                /              /                 /               /             /
+
+
+           // print!("{}", gaps.iter().take(5).map(|g| g.to_string()).join(";")); <-- for use with script.py
+
+            let mut wtr_log: Writer<File> = Writer::from_path(format!("data/{}/{}_{}-log.csv", dataset, var, dataset))?;
+            wtr_log.write_record(vec!["time_start", "time_end", "ind_f_start", "ind_f_end", "hr_start", "hr_end", "gap_time", "gap_len", "ind_s"])?;
+
+            let mut fill = 0usize; // <-- fill padding to emulate filled indices using standard
+            for gap in gaps {
+                let (row_start, row_end) = (rows[gap-1].clone(), rows[gap].clone());
+                let mut diff = {
+                    let (ut_start, ut_end) = (UTime::from_hr(&row_start.time), UTime::from_hr(&row_end.time));
+                    ut_end.diff(&ut_start)
+                };
+                diff.step(-1); // <-- plain diff is off-by-1 for physical counting
+                let ind_offset = gap + fill; // <-- note: user-facing indices all assume 0-start indexing. csvlens reports using 1-start but 'ts fine.
+
+                let record: Vec<String> = vec![row_start.time, row_end.time, ind_offset.to_string(), (ind_offset + diff.to_unix() as usize).to_string(), row_start.hr.to_string(), row_end.hr.to_string(), diff.to_prt(), diff.to_unix().to_string(), gap.to_string()];
+                wtr_log.write_record(&record)?;
+
+                fill = fill + diff.to_unix() as usize; // update fill with size of gap = num entries added = emulated index in filled csv. -1 due to fence shenanigans
+            }
         }
 
-        DclxMode::RewriteTsepT2 | DclxMode::AppendTsepT2 => { // For sake of ease and scope assuming all accepted dates are within the same year. Most (all?)  of the data is set this way anyway and i'm not writing a datetime lib..
+        DclxMode::RewriteTsepT2 | DclxMode::RewriteAppendTsepT2 => { // For sake of ease and scope assuming all accepted dates are within the same year. Most (all?)  of the data is set this way anyway and i'm not writing a datetime lib..
             csw.write_record(vec!["day", "ts", "time", "hr"])?;
 
             let ut_init = UTime::from_hr(&rows[0].time);
             let day_marker = ut_init.day + cm2dd(ut_init.month) - 1; // start @ day 1
 
-            let is_mode_append = matches!(PROG_MODE, DclxMode::AppendTsepT2);
+            let is_mode_append = matches!(PROG_MODE, DclxMode::RewriteAppendTsepT2);
 
             for (i, row) in rows.iter().enumerate() {
                 let ut_curr = UTime::from_hr(&row.time);
@@ -345,9 +392,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let ut_gap = (UTime::from_hr(&rows[gap-1].time), UTime::from_hr(&rows[gap].time));
                     let diff = ut_gap.1.diff(&ut_gap.0).to_unix();
 
-                    for j in 1..diff { // <-- insert reverse order @ gap pos so no index recalc!
+                    for j in 0..diff-1 { // <-- insert reverse order @ gap pos so no index recalc!
                         let mut gap_clone = ut_gap.0.clone();
-                        let h = j as i64;
                         let nu_time = gap_clone.step(j as i64);
 
                         let (_, nmm, ndd, nh, nm, ns) = nu_time.segment();
@@ -511,12 +557,12 @@ pub(crate) fn cm2dd(until_mm: u8) -> u8 {
 //                                                          ▼                       outright manage this instead of turning a blind eye.
 /// (Brutal) macro for snipping string head into clone to avoid burrowing.
 pub(crate) fn behead(str: &str, len: usize) -> String {
-    str.clone()[len..].to_string()
+    str[len..].to_string()
 }
 
 /// Tail equivalent of behead.
 pub(crate) fn detail(str: &str, len: usize) -> String {
-    str.clone()[..str.len()-len].to_string()
+    str[..str.len()-len].to_string()
 }
 
 /// Offset a range by specified amount.
@@ -524,12 +570,17 @@ pub(crate) fn offset_range<T: Add<Output = T> + Clone>(range: &Range<T>, offset:
     Range { start: range.start.clone() + offset.clone(), end: range.end.clone() + offset }
 }
 
+/// Stringify vec of ToString trait objects.
+pub(crate) fn stringify_all<T: ToString>(items: &Vec<T>) -> Vec<String> {
+    items.iter().map(|x| x.to_string()).collect()
+}
+
 
 //    ▼ see hn:44586064
 //    ▼
 /// "Artisanal" FFI for python :)
 pub(crate) fn ffi_py(fname: &str, func: &str, args: Vec<&str>) -> String {
-    let (a,b,c)=(format!("{}venv/bin/python", PY_PATH), format!("{}{}", PY_PATH, fname), format!("import {}; print {}.{}({})", fname, fname, func, args.join(",")));
+ //   let (a,b,c)=(format!("{}venv/bin/python", PY_PATH), format!("{}{}", PY_PATH, fname), format!("import {}; print {}.{}({})", fname, fname, func, args.join(",")));
 
     let cmd = Command::new(format!("{}venv/bin/python", PY_PATH))
         .arg(format!("{}{}", PY_PATH, fname))
@@ -561,9 +612,16 @@ mod tests {
 
     #[test]
     fn utime_4unix() {
-        let ut = UTime::from(34, 1, 1, 680);
+        let ut = UTime::from_sec(34, 1, 26, U24::try_from(680).unwrap());
         let ut2 = UTime::from_unix(ut.to_unix());
         assert_eq!(ut.diff(&ut2).to_unix(), 0);
+    }
+
+    #[test]
+    fn utime_step() {
+        let mut ut = UTime::from_sec(34,4,23,U24::try_from(680).unwrap()); // 2004, 4, 23 ... 168, 2, 0
+        ut.step(1);
+        println!("{:?}", ut);
     }
 
 
