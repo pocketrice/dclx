@@ -10,8 +10,11 @@ use std::fmt::Display;
 use std::fs;
 use std::fs::File;
 use std::io::{stdin, stdout, Write};
-use std::ops::{Add, Range};
-use std::process::Command;
+use std::ops::{Add, Index, Range};
+use std::process::{Command, Stdio};
+use std::slice::Iter;
+use strum::IntoEnumIterator;
+use strum_macros::EnumIter;
 
 // ** GOAL **
 // Date gaps, per-date hour gaps, mem2visplot
@@ -28,12 +31,31 @@ use std::process::Command;
 //     }
 // }
 
+#[macro_export]
+macro_rules! boxify {
+    ($text:expr) => {{
+        let content = $text;
+        let width = content.lines().map(|l| l.chars().count()).max().unwrap_or(0) + 4;
+        let horizontal = "─".repeat(width - 2);
+
+        format!(
+            "┌{}┐\n│ {:<width$} │\n└{}┘",
+            horizontal,
+            content,
+            horizontal,
+            width = width - 4
+        )
+    }};
+}
+
 
 const _ASCII_RESIDUAL: u32 = 0x1CFD2; // <-- most optimal would be intx::from_be_bytes() but not a const function
 const PROG_MODE: DclxMode = DclxMode::RewriteAppendTsepV2;
 const _IS_LINE_ANNOTATED: bool = false;
 const NA: &'static str = "NA";
+const NUM_DATASETS: u8 = 16;
 const PY_PATH: &'static str = "~/Documents/IntelliJ/RustRover/dclx/py/"; //"../py/";
+const DATA_PATH: &'static str = "data";
 
 enum GlycemicVariable {
     Generic,
@@ -53,7 +75,7 @@ impl GlycemicVariable {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, EnumIter, PartialEq)]
 enum DclxMode {
     FixT1, //               ## Patches T1 into a T2 file.
     RewriteTsepV1, //       ## Separates timestamps into d & hh:mm:ss.
@@ -67,12 +89,12 @@ impl DclxMode {
     // HR_000-{suffix}.csv
     fn suffix(&self) -> &'static str {
         match *self {
-            DclxMode::FixT1 => "fixed",
-            DclxMode::RewriteTsepV1 => "rt1",
-            DclxMode::RewriteAppendTsepV1 => "rat1",
-            DclxMode::Analyze => "log",
-            DclxMode::RewriteAppendTsepV2 => "rt2",
-            DclxMode::MergeN => "minN",
+            DclxMode::FixT1 => "FIX",
+            DclxMode::RewriteTsepV1 => "RT1",
+            DclxMode::RewriteAppendTsepV1 => "RA1",
+            DclxMode::Analyze => "LOG",
+            DclxMode::RewriteAppendTsepV2 => "RT2",
+            DclxMode::MergeN => "MRG",
         }
     }
 
@@ -121,12 +143,20 @@ impl UTime {
 
     /// Construct from Type 1 data.
     pub fn from_min(year_since: u16, month: u8, day: u8, min: u16) -> Self {
-        UTime { year: 1970 + year_since, month, day, sec: U24::try_from(min as u32 * 60u32).unwrap() }
+        if month == 0 || day == 0 {
+            panic!("UTime cannot have 0 months/days");
+        }
+
+        UTime { year: year_since, month, day, sec: U24::try_from(min as u32 * 60u32).unwrap() }
     }
 
-    /// Construct from Type 2 data.,
+    /// Construct from Type 2 data.
     pub fn from_sec(year_since: u16, month: u8, day: u8, sec: U24) -> Self {
-        UTime { year: 1970 + year_since, month, day, sec }
+        if month == 0 || day == 0 {
+            panic!("UTime cannot have 0 months/days");
+        }
+
+        UTime { year: year_since, month, day, sec }
     }
 
     /// Construct from Type 1 or 2 raw CSV string.
@@ -138,7 +168,7 @@ impl UTime {
 
         if hr_time.as_bytes()[4] == 0x2D { // f1 never contains dashes, this is O(1) check
             UTime::from_sec(
-                hr_time[0..=3].parse::<u16>().unwrap(),
+                hr_time[0..=3].parse::<u16>().unwrap() - 1970,
                 hr_time[5..=6].parse::<u8>().unwrap(),
                 hr_time[8..=9].parse::<u8>().unwrap(),
                 // HH:MM:SS -> ( HH)(:MM)(:SS) -> [(2) * 60^2 + (1) * 60^1 + (0) * 60^0] - (0x20 * 60^2 + 0x3A * 60^1 + 0x3A * 60^0)
@@ -175,7 +205,7 @@ impl UTime {
             };
 
             let mod_bytes = hr_mod.split(' ').map(|s| s.parse::<u8>().unwrap()).collect::<Vec<_>>(); // TODO: asm should fix all the redundant mem use
-            UTime::from_min(2000 + mod_bytes[2] as u16, mod_bytes[0], mod_bytes[1], mod_bytes[3] as u16 * 60 + mod_bytes[4] as u16)
+            UTime::from_min(mod_bytes[2] as u16 - 1970, mod_bytes[0], mod_bytes[1], mod_bytes[3] as u16 * 60 + mod_bytes[4] as u16)
         }
 
 
@@ -195,38 +225,40 @@ impl UTime {
 
     /// Construct from Unix timestamp (in seconds).
     pub fn from_unix(unix_stamp: u64) -> Self {
-        let year = 1970 + (unix_stamp / 31557600) as u16;
+        let yr_since = (unix_stamp / 31536000) as u16; // years since 1970
+        let is_leap = is_leap(yr_since + 1970);
+        let leap_offset = ((yr_since as u64 + 1) / 4) * 86400; // offset leap days. Leap year starts @ 1972 so offset by 2, then skip current year so remove 1. TODO not future-proof for freaks ("div by 100 but not 400" e.g. 2100)
 
-        let mut raw = unix_stamp % 31557600;
+        let mut raw = unix_stamp % 31536000 - leap_offset; // an "evil bit-level hacking..." thought; for some reason subbing leap_offset works. for some reason, 1970-03-01 00:00:00 becomes 1970-02-29 00:00:00 but exact same to_unix() of 636249600!!
         let mut month = 1;
-        while raw > 28 * 86400 {
-            if raw < mm2dd(month) as u64 * 86400 { // $$$
-                println!("PANIC SOON! us={}, raw={}, mm={}", unix_stamp, raw, month);
+        while raw > if is_leap { 29 } else { 28 } * 86400 { // <-- using just "raw > 28 * 86400" ok for $LEAPYR-02-29 00:00:00 but failed $LEAPYR-02-29 00:00:01.
+            if raw < mm2dd(month, yr_since) as u64 * 86400 { // $$$DEBUG
+                println!("PANIC SOON! us={}, raw={}, mm2dd={}", unix_stamp, raw, mm2dd(month, yr_since));
             }
 
-            raw -= mm2dd(month) as u64 * 86400;
+            raw -= mm2dd(month, yr_since) as u64 * 86400;
             month += 1;
         }
-        println!("{}", month); // $$$
 
         let day = (1 + raw / 86400) as u8;
         let sec = U24::try_from(raw % 86400).unwrap();
 
-        Self { year, month, day, sec }
+        Self { year: yr_since, month, day, sec }
     }
 
     /// Convert to Unix timestamp (in seconds).
     pub fn to_unix(&self) -> u64 { // ...seconds
-        (self.year - 1970) as u64 * 31557600 // 365d = 31536000s, 366d = 31622400s, 365.25d = 31557600s
-            + ((1..self.month).fold(0u64, |acc, ss| acc + mm2dd(ss) as u64) // 1d = 86400s
-            + self.day as u64 - 1) * 86400
-            + u64::from(self.sec)
+        self.year as u64 * 31536000                                                                         // YEARS (s)... 365d = 31536000s, 366d = 31622400s, 365.25d = 31557600s
+            + ((1..self.month).fold(0u64, |acc, ss| acc + mm2dd(ss, self.year) as u64) // MONTH (d->s)... 1d = 86400s.
+            + self.day as u64 - 1                                                                           // DAYS (d->s)
+            + (self.year as u64 + 1) / 4 ) * 86400                                                          // LEAP DAYS (d->s)
+            + u64::from(self.sec)                                                                           // SEC (s)
     }
 
     /// Convert to human-readable time string (e.g. 4yr12mo8d 8h3m52s)
     pub fn to_hrt(&self) -> String {
         let (yy, mm, dd, h, m, s) = self.segment();
-        let decons: [(u8, &str); 6] = [ ((yy - 1970) as u8, "yr"), (mm-1, "mo"), (dd-1, "d"), (h, "h"), (m, "m"), (s, "s") ]; // <-- sadly (dyn Zero) or (dyn [custom UnInt=Display+Eq trait]) doesn't work since they're not dyn-compatible :c
+        let decons: [(u8, &str); 6] = [ ((yy + 1970) as u8, "yr"), (mm-1, "mo"), (dd-1, "d"), (h, "h"), (m, "m"), (s, "s") ]; // <-- sadly (dyn Zero) or (dyn [custom UnInt=Display+Eq trait]) doesn't work since they're not dyn-compatible :c
 
         let mut hrt = String::new();
         for (i, (n, label)) in decons.iter().enumerate() {
@@ -279,6 +311,12 @@ impl UTime {
         self
     }
 
+    /// Merge two UTimes into self, returning reference for chaining.
+    pub fn merge(&mut self, other: Self) -> &Self {
+        *self = Self::from_unix(self.to_unix() + other.to_unix());
+        self
+    }
+
     /// Segment sec into YY:MM:DD:hh:mm:ss (akin to py's datetime::timetuple)
     pub fn segment(&self) -> (u16, u8, u8, u8, u8, u8) {
         let m_sec = u32::from(self.sec);
@@ -297,7 +335,7 @@ impl Display for UTime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (_, _, _, h, m, s) = self.segment();
 
-        let str = format!("{:?}-{:02}-{:02} {:02}:{:02}:{:02}", self.year - 1970, self.month, self.day, h, m, s);
+        let str = format!("{:?}-{:02}-{:02} {:02}:{:02}:{:02}", self.year + 1970, self.month, self.day, h, m, s);
         write!(f, "{}", str) // TODO year seemingly becomes 3990?
     }
 }
@@ -309,39 +347,55 @@ impl Clone for UTime {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let arg = std::env::args().skip(1).next();
+    // ===================== SANITY CHECK ===================================================================
 
-    println!("\n\n**********************************\n CURRENT MODE IS {:?} \n**********************************\n", PROG_MODE);
+    // let ps_full = vec!["1970-01-01 00:00;00", "1970-12-08 12:08:18", "1971-01-01 00:00:00", "1990-03-01 00:00:00", "2020-01-01 00:00:00"];
+    // let ps_feb29 = vec!["2020-02-29 00:00:00", "2020-02-29 00:00:01"];
+    // let ps_blank = vec!["1972-02-29 00:00:01"];
+    // sanity_check($ps);
+
+    // ======================================================================================================
+
+    let arg = std::env::args().skip(1).next();
+    println!("{}", boxify!(format!("CURRENT MODE IS {:?}", PROG_MODE)));
 
     // ▼ looks like black magic, but take a close peek
-    let (filename, var, dataset): (String, String, String) = if let Some(name) = arg { // tiny hint on if let — binding only valid for the true branch!
+    let (var, dataset): (String, String) = if let Some(name) = arg { // tiny hint on if let — binding only valid for the true branch!
        // contingent on matching [A-Za-z]+_[A-Za-z]{3}\.csv TODO throw a fit if not compliant
         let segs = name.split_once('_').expect("Improper format");
-        (name.clone(), segs.0.to_string(), segs.1[..3].to_string())
+        println!("\n\ntea break... (^◇^)_旦 ⋆˚✿˖°\n");
+        tea_break(segs.0, Some(PROG_MODE), None);
+
+        (segs.0.to_string(), segs.1[..3].to_string())
     } else {
-        let (q1, q2) = (query("Variable"), query("Dataset"));
+        let q1 = query("Variable");
+        println!("\n\ntea break... (^◇^)_旦 ⋆˚✿˖°\n");
+        tea_break(&q1, Some(PROG_MODE), None);
 
-        let s1 = q1.to_ascii_uppercase();
-        let s2 = format!("{:03}", q2.parse::<u8>()?);
+        let q2 = query("Dataset");
 
-        (format!("data/{}/{}_{}.csv", s2, s1, s2), s1, s2)
+        (q1.to_ascii_uppercase(), format!("{:03}", q2.parse::<u8>()?))
     };
 
-    println!();
+    // ...such as /data/001/HR_001_LOG.csv
+    let (rpath, wpath) = {
+        let rs = format!("{}/{}/{}_{}.csv", DATA_PATH, dataset, var, dataset);
 
-    let data = File::options()
-        .read(true)
-        .write(true)
-        .open(&filename)?;
+        let mut ws = rs.clone();
+        ws.insert_str(ws.len() - 4, &format!("_{}", PROG_MODE.suffix()));
 
-    let mut csr = Reader::from_reader(&data);
+        (rs, ws)
+    };
+
+    //let teapath = format!("{}/{{}}/{}_{{}}_{{}}.csv", DATA_PATH, var); // Doesn't work b/c requires string known @ compile-time (can't guarantee inputs don't contain {{}}).
+
+    let mut csr = Reader::from_path(&rpath).expect(&format!("Bad read path @ {}", rpath));
     let mut csw: Writer<File> = {
-        let w_path = format!("{}.tmp", filename);
-        if fs::exists(w_path).is_ok() {
-            println!("!!! warning: rewriting existing .tmp\n");
+        if fs::exists(&wpath)? {
+            println!("!!! warning: rewriting existing csv\n");
         }
 
-        Writer::from_path(format!("{}.tmp", filename))?
+        Writer::from_path(&wpath).expect(&format!("Bad write path @ {}", wpath))
     };
 
     let mut rows: Vec<Row> = Vec::new();
@@ -352,16 +406,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rows.push(row);
     }
 
-    let (splits, _) = validate_chunking(&rows); // <-- csv indices; RLE representation of times
+    let (splits, _) = validate_chunking(&rows);                                                              // <-- csv indices; RLE representation of times
     let times = splits.iter().map(|s| UTime::from_hr(&rows.get(s-1).unwrap().time)).collect(); // <-- UTime; timestamp counterpart for splits
-    let mut gaps = id_gaps(&times, &splits); // <-- csv indices; low-adjacent to offending line, in other words [i, i+1] encapsulates the evil gap
+    let mut gaps = id_gaps(&times, &splits);                                                                 // <-- csv indices; low-adjacent to offending line, in other words [i, i+1] encapsulates the evil gap
 
     println!();
 
+    csw.write_record(PROG_MODE.header())?;
+
     match PROG_MODE {
         DclxMode::FixT1 => {
-           // csw.write_record(vec!["time", "hr"])?; <-- seems to be already written?!
-
             let mut curr: (String, u8) = (String::new(), 0);
 
             for row in rows {
@@ -397,9 +451,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
            // print!("{}", gaps.iter().take(5).map(|g| g.to_string()).join(";")); <-- for use with script.py
 
-            let mut wtr_log: Writer<File> = Writer::from_path(format!("data/{}/{}_{}-log.csv", dataset, var, dataset))?;
-            wtr_log.write_record(vec!["time_start", "time_end", "ind_f_start", "ind_f_end", "hr_start", "hr_end", "gap_time", "gap_len", "ind_s"])?;
-
             let mut fill = 0usize; // <-- fill padding to emulate filled indices using standard
             for gap in gaps {
                 let (row_start, row_end) = (rows[gap-1].clone(), rows[gap].clone());
@@ -413,24 +464,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ind_offset = gap + fill; // <-- note: user-facing indices all assume 0-start indexing. csvlens reports using 1-start but 'ts fine.
 
                 let record: Vec<String> = vec![row_start.time, row_end.time, ind_offset.to_string(), (ind_offset + diff.to_unix() as usize).to_string(), row_start.hr.to_string(), row_end.hr.to_string(), diff.to_prt(), diff.to_unix().to_string(), gap.to_string()];
-                wtr_log.write_record(&record)?;
+                csw.write_record(&record)?;
 
-                fill = fill + diff.to_unix() as usize; // update fill with size of gap = num entries added = emulated index in filled csv. -1 due to fence shenanigans
+                fill += diff.to_unix() as usize; // update fill with size of gap = num entries added = emulated index in filled csv. -1 due to fence shenanigans
             }
         }
 
         DclxMode::RewriteTsepV1 | DclxMode::RewriteAppendTsepV1 | DclxMode::RewriteAppendTsepV2 => { // For sake of ease and scope assuming all accepted dates are within the same year. Most (all?)  of the data is set this way anyway and i'm not writing a datetime lib..
-            csw.write_record(PROG_MODE.header())?;
-
             let ut_init = UTime::from_hr(&rows[0].time);
-            let day_marker = ut_init.day + cm2dd(ut_init.month) - 1; // start @ day 1
+            let day_marker = ut_init.day + cm2dd(ut_init.month, ut_init.year) - 1; // start @ day 1
 
             let is_mode_append = matches!(PROG_MODE, DclxMode::RewriteAppendTsepV1) || matches!(PROG_MODE, DclxMode::RewriteAppendTsepV2); // TODO: either enum bitmask OR matches! for n > 1?
 
             for (i, row) in rows.iter().enumerate() {
                 let ut_curr = UTime::from_hr(&row.time);
-                let (_, mm, dd, h, m, s) = ut_curr.segment();
-                let day_delta = ((dd + cm2dd(mm)) - day_marker).to_string();
+                let (yy, mm, dd, h, m, s) = ut_curr.segment();
+                let day_delta = ((dd + cm2dd(mm, yy)) - day_marker).to_string();
 
                 if is_mode_append && i == *gaps.first().unwrap_or(&0) {
                     let gap = gaps.remove(0);
@@ -443,8 +492,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut gap_clone = ut_gap.0.clone();
                         let nu_time = gap_clone.step(j as i64);
 
-                        let (_, nmm, ndd, nh, nm, ns) = nu_time.segment();
-                        let nu_delta = (ndd + cm2dd(nmm)) - day_marker;
+                        let (nyy, nmm, ndd, nh, nm, ns) = nu_time.segment();
+                        let nu_delta = (ndd + cm2dd(nmm, nyy)) - day_marker;
 
                         match PROG_MODE {
                             DclxMode::RewriteAppendTsepV1 => {
@@ -476,11 +525,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let n = query("# of minutes to merge?")
                 .parse::<u64>().expect("Bad merge n");
 
-            csw.write_record(DclxMode::MergeN.header())?;
-
             let ut_init = UTime::from_hr(&rows[0].time);
             let mut ut_counter = ut_init.clone();
-            let day_marker = ut_init.day + cm2dd(ut_init.month) - 1;
+            let day_marker = ut_init.day + cm2dd(ut_init.month, ut_init.year) - 1;
 
             // rather than .iter() instead manually go thru all times (indirection requires manual check)
             let mut row_iter = rows.iter().peekable();
@@ -505,12 +552,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     NA
                 };
-                let (_, mm, dd, h, m, _) = ut_counter.segment();
-                let day_delta = (dd + cm2dd(mm) - day_marker).to_string();
+                let (yy, mm, dd, h, m, _) = ut_counter.segment();
+                let day_delta = (dd + cm2dd(mm, yy) - day_marker).to_string();
 
 
                 // write record
-                if hr_len != 60 {
+                if hr_len != 60 * n as usize {
                     println!("merged {} entries @ {}", hr_len, stopper);
                 }
                 csw.write_record(vec![&day_delta, &h.to_string(), &m.to_string(), hr_avg])?;
@@ -521,7 +568,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("OK");
+    println!("\nOK\n");
+    tea_break(&var, Some(PROG_MODE), Some((PROG_MODE, dataset.parse().unwrap())));
     Ok(())
 }
 
@@ -647,11 +695,11 @@ fn vis_gap(gap: u64) {
 // }
 
 // should be easy to adapt this to unzip_min using Rev()
-pub(crate) fn unzip_max<T: Ord + Clone>(data: &Vec<(T, T)>) -> (T, T) {
+pub fn unzip_max<T: Ord + Clone>(data: &Vec<(T, T)>) -> (T, T) {
     let (dat_x, dat_y): (Vec<_>, Vec<_>) = data.iter().cloned().unzip();
     (dat_x.iter().max().unwrap().clone(), dat_y.iter().max().unwrap().clone())
 }
-pub(crate) fn query(msg: &str) -> String {
+pub fn query(msg: &str) -> String {
     print!("{}", format!("{} ... ", msg));
     let _ = stdout().flush();
 
@@ -663,46 +711,71 @@ pub(crate) fn query(msg: &str) -> String {
 // pub(crate) fn query_til(bfr: &mut String, )
 
 // Single month to days (aka PDF?) TODO: replace the paltry leap year patch with actual work iff several years involved
-pub(crate) fn mm2dd(mm: u8) -> u8 { // https://cmcenroe.me/2014/12/05/days-in-month-formula.html
-    if mm == 2 {
-        29
-    } else {
-        28 + (mm + (mm / 8)) % 2 + (2 % mm) + 2 * (1 / mm)
+pub fn mm2dd(mm: u8, yr_since: u16) -> u8 { // https://cmcenroe.me/2014/12/05/days-in-month-formula.html
+    match mm {
+        2 if is_leap(yr_since + 1970) => 29,
+        1..=12 => 28 + (mm + (mm / 8)) % 2 + (2 % mm) + 2 * (1 / mm),
+        _ => 0
     }
 }
 
+/// Leap year check. Leap if year divisible by 4 but not for divisible by 100 except if divisible by 400.
+pub fn is_leap(yr: u16) -> bool {
+    yr % 4 == 0 && (!(yr % 100 == 0) || yr % 400 == 0)
+}
+
 // Cumulative months to days (aka CDF?) TODO better naming please -n-
-pub(crate) fn cm2dd(until_mm: u8) -> u8 {
-    (1..until_mm).map(mm2dd).sum::<u8>()
+pub fn cm2dd(until_mm: u8, yr_since: u16) -> u8 {
+    (1..until_mm).map(|m| mm2dd(m, yr_since)).sum::<u8>()
 }
 
 //                                                          ▼ "borrow burrowing"... falling into a hole of borrowing. Best to learn how to
 //                                                          ▼                       outright manage this instead of turning a blind eye.
 /// (Brutal) macro for snipping string head into clone to avoid burrowing.
-pub(crate) fn behead(str: &str, len: usize) -> String {
+pub fn behead(str: &str, len: usize) -> String {
     str[len..].to_string()
 }
 
 /// Tail equivalent of behead.
-pub(crate) fn detail(str: &str, len: usize) -> String {
+pub fn detail(str: &str, len: usize) -> String {
     str[..str.len()-len].to_string()
 }
 
 /// Offset a range by specified amount.
-pub(crate) fn offset_range<T: Add<Output = T> + Clone>(range: &Range<T>, offset: T) -> Range<T> {
+pub fn offset_range<T: Add<Output = T> + Clone>(range: &Range<T>, offset: T) -> Range<T> {
     Range { start: range.start.clone() + offset.clone(), end: range.end.clone() + offset }
 }
 
 /// Stringify vec of ToString trait objects.
-pub(crate) fn stringify_all<T: ToString>(items: &Vec<T>) -> Vec<String> {
+pub fn stringify_all<T: ToString>(items: &Vec<T>) -> Vec<String> {
     items.iter().map(|x| x.to_string()).collect()
 }
+
+/// Send contents to clipboard.
+fn to_clipboard(contents: &str) {
+    let mut pbcopy = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn().unwrap();
+
+    pbcopy.stdin.as_mut().unwrap().write_all(contents.as_bytes()).unwrap();
+    pbcopy.wait().unwrap();
+}
+
+/// Get all except for the given range.
+// pub fn slice_except<T>(buf: &[T], except: Range<usize>) -> &[T]
+// where
+//     T: Index<usize> + ?Sized {
+//     let mut slice: Vec<T> = Vec::with_capacity(buf.len() - except.len());
+//     slice.extend_from_slice(&buf[0..except.start]);
+//     slice.extend_from_slice(&buf[except.end..]);
+//     &[slice]
+// }
 
 
 //    ▼ see hn:44586064
 //    ▼
 /// "Artisanal" FFI for python :)
-pub(crate) fn ffi_py(fname: &str, _func: &str, args: Vec<&str>) -> String {
+pub fn ffi_py(fname: &str, _func: &str, args: Vec<&str>) -> String {
  //   let (a,b,c)=(format!("{}venv/bin/python", PY_PATH), format!("{}{}", PY_PATH, fname), format!("import {}; print {}.{}({})", fname, fname, func, args.join(",")));
 
     let cmd = Command::new(format!("{}venv/bin/python", PY_PATH))
@@ -713,24 +786,52 @@ pub(crate) fn ffi_py(fname: &str, _func: &str, args: Vec<&str>) -> String {
     String::from_utf8(cmd.unwrap().stderr).unwrap()
 }
 
+/// Checks for file status for all $NUM_DATA datasets and prints a nice matrix.
+pub fn tea_break(var: &str, hl: Option<DclxMode>, mark: Option<(DclxMode, u8)>) {
+    println!("┌──{}────┐", DclxMode::iter()
+        .map(|d| format!("── {} ", d.suffix()))
+        .fold(String::new(), |acc, s| acc + &s));
+
+    for i in 1..NUM_DATASETS {
+        println!("║ {: <5}{}║", i, DclxMode::iter()
+            .map(|d| format!("{}      ",
+                            match d {
+                                d if mark.as_ref().is_some_and(|(mode, ind)| d == *mode && i == *ind) => '▓', // Extra highlight; skip file check if newly made file.
+
+                                _ if fs::exists(format!("{}/{:03}/{}_{:03}_{}.csv", DATA_PATH, i, var, i, d.suffix()))   // Norm highlight; checks if file exists.
+                                 .expect("Failed to query file") => '▒',
+
+                                d if hl.as_ref().is_some_and(|mode| d == *mode) => '*',                             // Extra dot; in selected mode column.
+
+                                _ => '.'                                                                                       // Norm dot; N/A.
+
+                            }
+            )).fold(String::new(), |acc, s| acc + &s));
+    }
+
+    println!("└{}┘\n", "─".repeat(48));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn s_mm22dd() { // [s] standard, non-obj test
-        assert_eq!(mm2dd(1), 31);
-        assert_eq!(mm2dd(2), 29);
-        assert_eq!(mm2dd(3), 31);
-        assert_eq!(mm2dd(4), 30);
-        assert_eq!(mm2dd(5), 31);
-        assert_eq!(mm2dd(6), 30);
-        assert_eq!(mm2dd(7), 31);
-        assert_eq!(mm2dd(8), 31);
-        assert_eq!(mm2dd(9), 30);
-        assert_eq!(mm2dd(10), 31);
-        assert_eq!(mm2dd(11), 30);
-        assert_eq!(mm2dd(12), 31);
+        assert_eq!(mm2dd(1, 50), 31);
+        assert_eq!(mm2dd(2, 49), 28);
+        assert_eq!(mm2dd(2, 50), 29);
+        assert_eq!(mm2dd(3, 50), 31);
+        assert_eq!(mm2dd(4, 50), 30);
+        assert_eq!(mm2dd(5, 50), 31);
+        assert_eq!(mm2dd(6, 50), 30);
+        assert_eq!(mm2dd(7, 50), 31);
+        assert_eq!(mm2dd(8, 50), 31);
+        assert_eq!(mm2dd(9, 50), 30);
+        assert_eq!(mm2dd(10, 50), 31);
+        assert_eq!(mm2dd(11, 50), 30);
+        assert_eq!(mm2dd(12, 50), 31);
+        assert_eq!(mm2dd(13, 50), 0);
     }
 
     #[test]
@@ -742,7 +843,7 @@ mod tests {
 
     #[test]
     fn utime_step() {
-        let mut ut = UTime::from_sec(34,4,23,U24::try_from(680).unwrap()); // 2004, 4, 23 ... 168, 2, 0
+        let mut ut = UTime::from_sec(34,4,23, U24::try_from(680).unwrap()); // 2004, 4, 23 ... 168, 2, 0
         ut.step(1);
         println!("{:?}", ut);
     }
@@ -782,14 +883,14 @@ mod tests {
 
     #[test]
     fn utime_24unix_fm() { // 2(u) and 4(rom) unix test
-        let ut: UTime = UTime::from_min(32,3,8,300);
+        let ut: UTime = UTime::from_min(1,1,1,0);
         let ut2: UTime = UTime::from_unix(ut.to_unix());
         assert_eq!(ut.to_unix(), ut2.to_unix());
     }
 
     #[test]
     fn utime_24unix_etern() {
-        let ut = UTime::from_unix(63751447600);
+        let ut = UTime::from_unix(1582977601);
         let ut2: UTime = UTime::from_unix(ut.to_unix());
 
         for i in 0..99999 {
@@ -802,11 +903,75 @@ mod tests {
         assert_eq!(ut.to_unix(), ut2.to_unix());
     }
 
+    // Check for any issues with calculating 02/29/20.
     #[test]
-    fn utime_22920() {
-        let year = UTime::from_hr("2020-01-01 00:00:00");
-        assert_eq!(year.to_unix(), 333);
+    fn utime_022920() {
+        let (mut y,md) = (UTime::from_hr("2020-01-01 00:00:00"), UTime::from_hr("1970-02-29 00:00:00"));
+        assert_eq!(y.to_unix(), 1577880000);
+        assert_eq!(md.to_unix(), 5097600);
+        assert_eq!(UTime::from_hr("2020-02-29 00:00:00").to_unix(), y.to_unix() + md.to_unix());
     }
 
+    // Check for any issues with calculating to 03/01/20.
+    #[test]
+    fn utime_030120_calc() {
+        let ut = UTime::from_hr("2020-03-01 00:00:00");
+        let ut2 = UTime::from_unix(ut.to_unix());
+        assert_eq!(ut.to_unix(), ut2.to_unix());
+    }
+
+    // Check for any issues when shifting to 03/01/20
+    #[test]
+    fn utime_030120_shift() {
+        let mut ut = UTime::from_hr("2020-02-29 23:59:59");
+        ut.step(1);
+    }
+
+    #[test]
+    fn utime_merge() {
+        let (mut u1, u2) = (UTime::from_hr("2020-01-02 00:00:00"), UTime::from_hr("1970-01-31 00:00:00"));
+        u1.merge(u2);
+        assert_eq!(u1.to_string(), "2020-02-01 00:00:00");
+    }
+
+    #[test]
+    fn utime_panic_ts() {
+        let yr = UTime::from_min(5,2,28,0);
+       // let ut = UTime::from_unix(1577880000);
+        println!("{}", yr.to_unix())
+    }
 }
 
+fn sanity_check(presets: Vec<&str>) {
+    println!("{}\n", boxify!("*** SANITY CHECK SANITY CHECK SANITY CHECK SANITY CHECK SANITY CHECK SANITY CHECK ***"));
+
+    for ps in presets {
+        println!("Preset utime --- {}", ps);
+
+        let rut = UTime::from_hr(ps);
+        println!("         RAW >>> {} @ {}", rut, rut.to_unix());
+
+        let cut = UTime::from_unix(rut.to_unix());
+        println!("        CONV <<< {} @ {}\n\n", cut, cut.to_unix());
+    }
+
+    loop {
+        let ut = {
+            let q = query("Enter utime").replace(";", ":");
+
+            if q.contains(":") {
+                q
+            } else {
+                q + " 00:00:00"
+            }
+        };
+
+        let rut = UTime::from_hr(&ut);
+        println!("        RAW >>> {} @ {}", rut, rut.to_unix());
+
+        let cut = UTime::from_unix(rut.to_unix());
+        println!("       CONV <<< {} @ {}\n\n", cut, cut.to_unix());
+
+        to_clipboard(&rut.to_unix().to_string())
+    }
+}
