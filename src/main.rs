@@ -12,15 +12,26 @@ use std::fs::File;
 use std::io::{stdin, stdout, Write};
 use std::ops::{Add, Range};
 use std::process::Command;
+
 // ** GOAL **
 // Date gaps, per-date hour gaps, mem2visplot
 
 // IDEA - CLI tool "pin" (pin a location or file and unpin) to release alias
-// IDEA - cctv-1
 
-const ASCII_RESIDUAL: u32 = 0x1CFD2; // <-- most optimal would be intx::from_be_bytes() but not a const function
-const PROG_MODE: DclxMode = DclxMode::AnalyzeT2;
-const IS_LINE_ANNOTATED: bool = false;
+// #[macro_export]
+// macro_rules! query {
+//     () => {
+//
+//     };
+//     ( $($msg:tt)* ) => {
+//
+//     }
+// }
+
+
+const _ASCII_RESIDUAL: u32 = 0x1CFD2; // <-- most optimal would be intx::from_be_bytes() but not a const function
+const PROG_MODE: DclxMode = DclxMode::RewriteAppendTsepV2;
+const _IS_LINE_ANNOTATED: bool = false;
 const NA: &'static str = "NA";
 const PY_PATH: &'static str = "~/Documents/IntelliJ/RustRover/dclx/py/"; //"../py/";
 
@@ -31,21 +42,47 @@ enum GlycemicVariable {
     HeartRate
 }
 
-#[derive(Debug)]
-enum DclxMode {
-    FixT1,
-    RewriteTsepT2, // tsep = time separators
-    RewriteAppendTsepT2,
-    AnalyzeT2,
+impl GlycemicVariable {
+    fn _value(&self) -> &'static str {
+        match *self {
+            GlycemicVariable::Generic => "",
+            GlycemicVariable::Dexcom => "1",
+            GlycemicVariable::FoodLog => "2",
+            GlycemicVariable::HeartRate => "HR"
+        }
+    }
 }
 
-impl GlycemicVariable {
-    fn value(&self) -> String {
+#[derive(Debug)]
+enum DclxMode {
+    FixT1, //               ## Patches T1 into a T2 file.
+    RewriteTsepV1, //       ## Separates timestamps into d & hh:mm:ss.
+    RewriteAppendTsepV1, // ## Applies RewriteTsepV1 + fills NA values.
+    Analyze, //             ## Output .log file for missing values etc for a particular dataset.
+    RewriteAppendTsepV2, // ## Separates timestamps into d,h,m,s,hh:mm:ss + fills NA values.
+    MergeN, //              ## Condenses dataset by averaging HR values into N min chunks.
+}
+
+impl DclxMode {
+    // HR_000-{suffix}.csv
+    fn suffix(&self) -> &'static str {
         match *self {
-            GlycemicVariable::Generic => String::from(""),
-            GlycemicVariable::Dexcom => String::from("1"),
-            GlycemicVariable::FoodLog => String::from("2"),
-            GlycemicVariable::HeartRate => String::from("HR")
+            DclxMode::FixT1 => "fixed",
+            DclxMode::RewriteTsepV1 => "rt1",
+            DclxMode::RewriteAppendTsepV1 => "rat1",
+            DclxMode::Analyze => "log",
+            DclxMode::RewriteAppendTsepV2 => "rt2",
+            DclxMode::MergeN => "minN",
+        }
+    }
+
+    fn header(&self) -> &'static [&str] {
+        match *self {
+            DclxMode::FixT1 => &["datetime", "hr"],
+            DclxMode::RewriteTsepV1 | DclxMode::RewriteAppendTsepV1 => &["day", "ts", "datetime", "hr"],
+            DclxMode::Analyze => &["time_start", "time_end", "ind_f_start", "ind_f_end", "hr_start", "hr_end", "gap_time", "gap_len", "ind_s"],
+            DclxMode::RewriteAppendTsepV2 => &["day", "hour", "min", "sec", "ts", "time", "hr"],
+            DclxMode::MergeN => &["day", "hour", "min", "hr"]
         }
     }
 }
@@ -158,14 +195,19 @@ impl UTime {
 
     /// Construct from Unix timestamp (in seconds).
     pub fn from_unix(unix_stamp: u64) -> Self {
-        let year = 1970 + (unix_stamp / 31536000) as u16;
+        let year = 1970 + (unix_stamp / 31557600) as u16;
 
-        let mut raw = unix_stamp % 31536000;
+        let mut raw = unix_stamp % 31557600;
         let mut month = 1;
         while raw > 28 * 86400 {
+            if raw < mm2dd(month) as u64 * 86400 { // $$$
+                println!("PANIC SOON! us={}, raw={}, mm={}", unix_stamp, raw, month);
+            }
+
             raw -= mm2dd(month) as u64 * 86400;
             month += 1;
         }
+        println!("{}", month); // $$$
 
         let day = (1 + raw / 86400) as u8;
         let sec = U24::try_from(raw % 86400).unwrap();
@@ -175,7 +217,7 @@ impl UTime {
 
     /// Convert to Unix timestamp (in seconds).
     pub fn to_unix(&self) -> u64 { // ...seconds
-        (self.year - 1970) as u64 * 31536000 // 365d = 31536000s
+        (self.year - 1970) as u64 * 31557600 // 365d = 31536000s, 366d = 31622400s, 365.25d = 31557600s
             + ((1..self.month).fold(0u64, |acc, ss| acc + mm2dd(ss) as u64) // 1d = 86400s
             + self.day as u64 - 1) * 86400
             + u64::from(self.sec)
@@ -211,10 +253,15 @@ impl UTime {
         format!("{:02}:{:02}:{:02}", h, m, s)
     }
 
-    /// Calculate the diff between times (positive-only) stored as UTime.
-    pub fn diff(&self, other: &UTime) -> UTime {
+    /// Calculate the diff between times (positive-only) stored as UTime. Errors if produces a negative.
+    pub fn diff(&self, other: &UTime) -> Result<UTime, ()> {
        // println!("{} + {} ///// {} - {}\n", self, other, self.to_unix(), other.to_unix());
-        Self::from_unix(self.to_unix() - other.to_unix())
+        let (u1, u2) = (self.to_unix(), other.to_unix());
+        if let Some(result) = u1.checked_sub(u2) {
+            Ok(Self::from_unix(result))
+        } else {
+            Err(())
+        }
     }
 
     /// Step forwards/backwards the designated amount of seconds. Returns self for chaining.
@@ -272,12 +319,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let segs = name.split_once('_').expect("Improper format");
         (name.clone(), segs.0.to_string(), segs.1[..3].to_string())
     } else {
-        let (mut s1, mut s2) = (String::new(), String::new());
-        query(&mut s1, "Variable");
-        query(&mut s2, "Dataset");
+        let (q1, q2) = (query("Variable"), query("Dataset"));
 
-        s1 = s1.trim().to_ascii_uppercase();
-        s2 = format!("{:03}", s2.trim().parse::<u8>()?);
+        let s1 = q1.to_ascii_uppercase();
+        let s2 = format!("{:03}", q2.parse::<u8>()?);
 
         (format!("data/{}/{}_{}.csv", s2, s1, s2), s1, s2)
     };
@@ -337,7 +382,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        DclxMode::AnalyzeT2 => {
+        DclxMode::Analyze => {
             // 08/12/25 change: HR_001.csv -> HR_001-log.csv
             // format:                                                  indices in "filled" (rewrite/appended) csv (b/c normal would just be i and i+1)
             //                                                       -------------------
@@ -361,7 +406,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut diff = {
                     let (ut_start, ut_end) = (UTime::from_hr(&row_start.time), UTime::from_hr(&row_end.time));
                     ut_end.diff(&ut_start)
-                };
+                }.unwrap();
+
+
                 diff.step(-1); // <-- plain diff is off-by-1 for physical counting
                 let ind_offset = gap + fill; // <-- note: user-facing indices all assume 0-start indexing. csvlens reports using 1-start but 'ts fine.
 
@@ -372,25 +419,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        DclxMode::RewriteTsepT2 | DclxMode::RewriteAppendTsepT2 => { // For sake of ease and scope assuming all accepted dates are within the same year. Most (all?)  of the data is set this way anyway and i'm not writing a datetime lib..
-            csw.write_record(vec!["day", "ts", "time", "hr"])?;
+        DclxMode::RewriteTsepV1 | DclxMode::RewriteAppendTsepV1 | DclxMode::RewriteAppendTsepV2 => { // For sake of ease and scope assuming all accepted dates are within the same year. Most (all?)  of the data is set this way anyway and i'm not writing a datetime lib..
+            csw.write_record(PROG_MODE.header())?;
 
             let ut_init = UTime::from_hr(&rows[0].time);
             let day_marker = ut_init.day + cm2dd(ut_init.month) - 1; // start @ day 1
 
-            let is_mode_append = matches!(PROG_MODE, DclxMode::RewriteAppendTsepT2);
+            let is_mode_append = matches!(PROG_MODE, DclxMode::RewriteAppendTsepV1) || matches!(PROG_MODE, DclxMode::RewriteAppendTsepV2); // TODO: either enum bitmask OR matches! for n > 1?
 
             for (i, row) in rows.iter().enumerate() {
                 let ut_curr = UTime::from_hr(&row.time);
                 let (_, mm, dd, h, m, s) = ut_curr.segment();
-                let day_delta = (dd + cm2dd(mm)) - day_marker;
+                let day_delta = ((dd + cm2dd(mm)) - day_marker).to_string();
 
                 if is_mode_append && i == *gaps.first().unwrap_or(&0) {
                     let gap = gaps.remove(0);
                     println!("mending {}", gap);
 
                     let ut_gap = (UTime::from_hr(&rows[gap-1].time), UTime::from_hr(&rows[gap].time));
-                    let diff = ut_gap.1.diff(&ut_gap.0).to_unix();
+                    let diff = ut_gap.1.diff(&ut_gap.0).unwrap().to_unix();
 
                     for j in 0..diff-1 { // <-- insert reverse order @ gap pos so no index recalc!
                         let mut gap_clone = ut_gap.0.clone();
@@ -399,11 +446,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let (_, nmm, ndd, nh, nm, ns) = nu_time.segment();
                         let nu_delta = (ndd + cm2dd(nmm)) - day_marker;
 
-                        csw.write_record(vec![&nu_delta.to_string(), &format!("{:02}:{:02}:{:02}", nh, nm, ns), &nu_time.to_string(), NA])?;
+                        match PROG_MODE {
+                            DclxMode::RewriteAppendTsepV1 => {
+                                csw.write_record(vec![&nu_delta.to_string(), &format!("{:02}:{:02}:{:02}", nh, nm, ns), &nu_time.to_string(), NA])?;
+                            }
+                            DclxMode::RewriteAppendTsepV2 => {
+                                csw.write_record(vec![&nu_delta.to_string(), &nh.to_string(), &nm.to_string(), &ns.to_string(), &format!("{:02}:{:02}:{:02}", nh, nm, ns), &nu_time.to_string(), NA])?;
+                            }
+                            _ => unreachable!(),
+                        }
                     }
                 }
 
-                csw.write_record(vec![&day_delta.to_string(), &format!("{:02}:{:02}:{:02}", h, m, s), &row.time, &row.hr.to_string()])?
+
+                let mut record = vec![day_delta, format!("{:02}:{:02}:{:02}", &h, &m, &s), row.time.clone(), row.hr.clone().to_string()];
+
+                // insert add'l V2 values
+                if matches!(PROG_MODE, DclxMode::RewriteAppendTsepV2) {
+                    record.insert(1, s.to_string());
+                    record.insert(1, m.to_string());
+                    record.insert(1, h.to_string());
+                }
+
+                csw.write_record(record)?;
+            }
+        }
+
+        DclxMode::MergeN => { // NOTE: run this on a non-filled dataset
+            let n = query("# of minutes to merge?")
+                .parse::<u64>().expect("Bad merge n");
+
+            csw.write_record(DclxMode::MergeN.header())?;
+
+            let ut_init = UTime::from_hr(&rows[0].time);
+            let mut ut_counter = ut_init.clone();
+            let day_marker = ut_init.day + cm2dd(ut_init.month) - 1;
+
+            // rather than .iter() instead manually go thru all times (indirection requires manual check)
+            let mut row_iter = rows.iter().peekable();
+            while row_iter.len() > 0 {
+                let stopper = ut_counter.to_unix() + (60 * n); // stop accumulation @ X minutes from initial counter
+                let (mut hr_tot, mut hr_len) = (0f32, 0usize);
+
+                // Add all rows within
+                while let Some(&row) = row_iter.peek() {
+                    if UTime::from_hr(&row.time).to_unix() < stopper {
+                        let _ = row_iter.next();
+                        hr_tot += row.hr;
+                        hr_len += 1;
+                    } else {
+                        break
+                    }
+                }
+
+                // fetch values to write
+                let hr_avg = if hr_len > 0 {
+                    &format!("{:.02}", hr_tot / hr_len as f32) // 2 sigfigs.
+                } else {
+                    NA
+                };
+                let (_, mm, dd, h, m, _) = ut_counter.segment();
+                let day_delta = (dd + cm2dd(mm) - day_marker).to_string();
+
+
+                // write record
+                if hr_len != 60 {
+                    println!("merged {} entries @ {}", hr_len, stopper);
+                }
+                csw.write_record(vec![&day_delta, &h.to_string(), &m.to_string(), hr_avg])?;
+
+                // update counter to next 5m segment
+                ut_counter = UTime::from_unix(stopper);
             }
         }
     }
@@ -478,6 +591,8 @@ fn validate_chunking(csr: &Vec<Row>) -> (Vec<usize>, Vec<u8>) {
 
 /// Identify gaps within Type 1 dataset. Returns CSV row low-adjacent to offending line (e.g. [index, index+1] is gap)
 fn id_gaps(times: &Vec<UTime>, splits: &Vec<usize>) -> Vec<usize> {
+    println!("{}", splits.len());
+
     let mut gaps = Vec::<usize>::new();
     let mut spl_ind = 0; // TODO maybe replace .windows() with std counting for loop
 
@@ -485,7 +600,8 @@ fn id_gaps(times: &Vec<UTime>, splits: &Vec<usize>) -> Vec<usize> {
         spl_ind += 1;
         let (w1, w2) = (w.first().unwrap(), w.last().unwrap()); // To get rid of seconds, notice that rather than strip() — resulting in clone — some clever manip works!
 
-        let mut diff = w2.diff(w1);
+        let mut diff = w2.diff(w1)
+            .expect(format!("Bad diff: {} @ {}, {} @ {}", w1, splits[spl_ind-1], w2, splits[spl_ind]).as_str());
         let diff_u = diff.to_unix();
 
         if diff_u > 60 {
@@ -535,17 +651,24 @@ pub(crate) fn unzip_max<T: Ord + Clone>(data: &Vec<(T, T)>) -> (T, T) {
     let (dat_x, dat_y): (Vec<_>, Vec<_>) = data.iter().cloned().unzip();
     (dat_x.iter().max().unwrap().clone(), dat_y.iter().max().unwrap().clone())
 }
-pub(crate) fn query(bfr: &mut String, msg: &str) {
+pub(crate) fn query(msg: &str) -> String {
     print!("{}", format!("{} ... ", msg));
     let _ = stdout().flush();
-    stdin().read_line(bfr).expect("Bad user string");
+
+    let mut bfr = String::new();
+    stdin().read_line(&mut bfr).expect("Bad user string");
+    bfr.trim().to_string()
 }
 
 // pub(crate) fn query_til(bfr: &mut String, )
 
-// Single month to days (aka PDF?)
+// Single month to days (aka PDF?) TODO: replace the paltry leap year patch with actual work iff several years involved
 pub(crate) fn mm2dd(mm: u8) -> u8 { // https://cmcenroe.me/2014/12/05/days-in-month-formula.html
-    28 + (mm + (mm / 8)) % 2 + (2 % mm) + 2 * (1 / mm)
+    if mm == 2 {
+        29
+    } else {
+        28 + (mm + (mm / 8)) % 2 + (2 % mm) + 2 * (1 / mm)
+    }
 }
 
 // Cumulative months to days (aka CDF?) TODO better naming please -n-
@@ -579,7 +702,7 @@ pub(crate) fn stringify_all<T: ToString>(items: &Vec<T>) -> Vec<String> {
 //    ▼ see hn:44586064
 //    ▼
 /// "Artisanal" FFI for python :)
-pub(crate) fn ffi_py(fname: &str, func: &str, args: Vec<&str>) -> String {
+pub(crate) fn ffi_py(fname: &str, _func: &str, args: Vec<&str>) -> String {
  //   let (a,b,c)=(format!("{}venv/bin/python", PY_PATH), format!("{}{}", PY_PATH, fname), format!("import {}; print {}.{}({})", fname, fname, func, args.join(",")));
 
     let cmd = Command::new(format!("{}venv/bin/python", PY_PATH))
@@ -597,7 +720,7 @@ mod tests {
     #[test]
     fn s_mm22dd() { // [s] standard, non-obj test
         assert_eq!(mm2dd(1), 31);
-        assert_eq!(mm2dd(2), 28);
+        assert_eq!(mm2dd(2), 29);
         assert_eq!(mm2dd(3), 31);
         assert_eq!(mm2dd(4), 30);
         assert_eq!(mm2dd(5), 31);
@@ -614,7 +737,7 @@ mod tests {
     fn utime_4unix() {
         let ut = UTime::from_sec(34, 1, 26, U24::try_from(680).unwrap());
         let ut2 = UTime::from_unix(ut.to_unix());
-        assert_eq!(ut.diff(&ut2).to_unix(), 0);
+        assert_eq!(ut.diff(&ut2).unwrap().to_unix(), 0);
     }
 
     #[test]
@@ -624,25 +747,66 @@ mod tests {
         println!("{:?}", ut);
     }
 
+    #[test]
+    fn sc_hr15() { // sc = sanch = sanity check
+        let (w1, w2) = (UTime::from_hr("2020-07-05 15:11:58"), UTime::from_hr("2020-07-05 15:11:59"));
+        let diff = w2.diff(&w1);
+    }
+
+    #[test]
+    fn sc_feb29() {
+        let (w1, w2) = (UTime::from_hr("2020-02-29 23:59:59"), UTime::from_hr("2020-03-01 00:00:59"));
+        let (d1, d2) = (w1.to_unix(), w2.to_unix());
+        assert_eq!(w2.diff(&w1).unwrap().to_unix(), 60)
+    }
 
 
-    // #[test]
-    // fn utime_2unix_base() { // [struct_name] is-obj test
-    //     let ut = UTime::from(0, 1, 1, 300);
-    //     assert_eq!(ut.to_unix(), 18000);
-    // }
-    //
-    // #[test]
-    // fn utime_2unix_mmdd() {
-    //     let ut: UTime = UTime::from(0, 12, 8, 300);
-    //     assert_eq!(ut.to_unix(), 29480400);
-    // }
-    //
-    // #[test]
-    // fn utime_2unix_yymmdd() {
-    //     let ut: UTime = UTime::from(34, 6,12,240);
-    //     assert_eq!(ut.to_unix(), 1087012800);
-    // }
+
+    #[test]
+    fn utime_2unix_base() { // [struct_name] is-obj test
+        let ut = UTime::from_min(0, 1, 1, 300);
+        assert_eq!(ut.to_unix(), 18000);
+    }
+
+    #[test]
+    fn utime_2unix_mmdd() {
+        let ut: UTime = UTime::from_min(0, 12, 8, 300);
+        assert_eq!(ut.to_unix(), 29480400 + 86400);
+    }
+
+    #[test]
+    fn utime_2unix_yymmdd() {
+        let ut: UTime = UTime::from_min(34, 6,12,240);
+        assert_eq!(ut.to_unix(), 1087012800 + 86400);
+    }
+
+    #[test]
+    fn utime_24unix_fm() { // 2(u) and 4(rom) unix test
+        let ut: UTime = UTime::from_min(32,3,8,300);
+        let ut2: UTime = UTime::from_unix(ut.to_unix());
+        assert_eq!(ut.to_unix(), ut2.to_unix());
+    }
+
+    #[test]
+    fn utime_24unix_etern() {
+        let ut = UTime::from_unix(63751447600);
+        let ut2: UTime = UTime::from_unix(ut.to_unix());
+
+        for i in 0..99999 {
+            let mut utc = ut.clone();
+            utc.step(i);
+            println!("{}", utc);
+            let ut_clone2 = UTime::from_unix(utc.to_unix());
+        }
+
+        assert_eq!(ut.to_unix(), ut2.to_unix());
+    }
+
+    #[test]
+    fn utime_22920() {
+        let year = UTime::from_hr("2020-01-01 00:00:00");
+        assert_eq!(year.to_unix(), 333);
+    }
 
 }
 
