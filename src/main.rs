@@ -9,7 +9,7 @@ use std::cmp::PartialEq;
 use std::fmt::Display;
 use std::fs;
 use std::fs::File;
-use std::io::{stdin, stdout, Write};
+use std::io::{stdin, stdout, BufRead, BufReader, Write};
 use std::ops::{Add, Range};
 use std::process::{Command, Stdio};
 use strum::IntoEnumIterator;
@@ -72,6 +72,12 @@ impl GlycemicVariable {
             GlycemicVariable::HeartRate => "HR"
         }
     }
+}
+
+#[derive(PartialEq)]
+enum DSType {
+    Type1,
+    Type2
 }
 
 #[derive(Debug, EnumIter, PartialEq)]
@@ -272,13 +278,13 @@ impl UTime {
     /// Convert to human-readable time string (e.g. 4yr12mo8d 8h3m52s)
     pub fn to_hrt(&self) -> String {
         let (yy, mm, dd, h, m, s) = self.segment();
-        let decons: [(u8, &str); 6] = [ ((yy + 1970) as u8, "yr"), (mm-1, "mo"), (dd-1, "d"), (h, "h"), (m, "m"), (s, "s") ]; // <-- sadly (dyn Zero) or (dyn [custom UnInt=Display+Eq trait]) doesn't work since they're not dyn-compatible :c
+        let decons: [(u8, &str); 6] = [ (yy as u8, "yr"), (mm-1, "mo"), (dd-1, "d"), (h, "h"), (m, "m"), (s, "s") ]; // <-- sadly (dyn Zero) or (dyn [custom UnInt=Display+Eq trait]) doesn't work since they're not dyn-compatible :c
 
         let mut hrt = String::new();
         for (i, (n, label)) in decons.iter().enumerate() {
             match i { // ...clarity over concision?
                 0 => {
-                    if n > &0u8 { hrt.push_str(format!("{}{}", *n as u16, label).as_str()) }
+                    if n > &0u8 { hrt.push_str(format!("{}{}", *n as u16 + 1970, label).as_str()) }
                 }
                 3 => {
                     if !hrt.is_empty() { hrt.push(' '); }
@@ -341,7 +347,7 @@ impl UTime {
     ///
     /// Handy for Type 2 → Type 1 data conversion. Produces new object in lieu of modification as Type 1 conversions are typically temporary.
     pub fn strip(&mut self) -> &mut Self {
-       self.step(-i64::from(self.segment().2))
+       self.step(-i64::from(self.segment().5))
     }
 }
 
@@ -372,6 +378,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n(f)ix type 1\n(r)ewrite time seps, granularity = 1\nrewrite + append (t)ime seps, g = 1\nrewrite + append (T)ime seps, g = 2\n(a)nalyze data\n(m)erge n mins\n");
 
+
     let mode = loop {
         match DclxMode::binding(query("\nbind to (f/r/t/T/a/m)").chars().next().unwrap()) {
             Some(mode) => break mode,
@@ -384,26 +391,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n\n{}\n", boxify!(format!("CURRENT MODE IS {:?}", mode)));
 
     // ▼ looks like black magic, but take a close peek
-    let (var, dataset): (String, String) = if let Some(name) = arg { // tiny hint on if let — binding only valid for the true branch!
+    let (var, dataset): (String, u8) = if let Some(name) = arg { // tiny hint on if let — binding only valid for the true branch!
        // contingent on matching [A-Za-z]+_[A-Za-z]{3}\.csv TODO throw a fit if not compliant
         let segs = name.split_once('_').expect("Improper format");
         println!("\n\ntea break... (^◇^)_旦 ⋆˚✿˖°\n");
         tea_break(segs.0, Some(&mode), None);
 
-        (segs.0.to_string(), segs.1[..3].to_string())
+        (segs.0.to_string(), segs.1[..3].parse::<u8>().expect("Invalid dataset num"))
     } else {
-        let q1 = query("Variable");
+        let q1 = "hr"; //query("Variable");
         println!("\n\ntea break... (^◇^)_旦 ⋆˚✿˖°\n");
         tea_break(&q1, Some(&mode), None);
 
         let q2 = query("Dataset");
 
-        (q1.to_ascii_uppercase(), format!("{:03}", q2.parse::<u8>()?))
+        (q1.to_ascii_uppercase(), q2.parse::<u8>()?)
     };
 
     // ...such as /data/001/HR_001_LOG.csv
     let (rpath, wpath) = {
-        let rs = format!("{}/{}/{}_{}.csv", DATA_PATH, dataset, var, dataset);
+        let rs = format!("{}/{:03}/{}_{:03}.csv", DATA_PATH, dataset, var, dataset);
 
         let mut ws = rs.clone();
         ws.insert_str(ws.len() - 4, &format!("_{}", mode.suffix()));
@@ -411,12 +418,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (rs, ws)
     };
 
+    let dstypes = (1..=NUM_DATASETS)
+        .into_iter()
+        .map(|i| id_dstype(&format!("{}/{:03}/{}_{:03}.csv", DATA_PATH, i, var, i)).unwrap())
+        .collect::<Vec<_>>();
+
+    if (mode == DclxMode::FixT1) ^ (dstypes[dataset as usize - 1] == DSType::Type1) {
+        panic!("!!! ABORT: wrong dataset type");
+    }
+
     //let teapath = format!("{}/{{}}/{}_{{}}_{{}}.csv", DATA_PATH, var); // Doesn't work b/c requires string known @ compile-time (can't guarantee inputs don't contain {{}}).
 
     let mut csr = Reader::from_path(&rpath).expect(&format!("Bad read path @ {}", rpath));
     let mut csw: Writer<File> = {
         if fs::exists(&wpath)? {
-            println!("!!! warning: rewriting existing csv\n");
+            println!("??? warning: rewriting existing csv\n");
         }
 
         Writer::from_path(&wpath).expect(&format!("Bad write path @ {}", wpath))
@@ -434,7 +450,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let times = splits.iter().map(|s| UTime::from_hr(&rows.get(s-1).unwrap().time)).collect(); // <-- UTime; timestamp counterpart for splits
     let mut gaps = id_gaps(&times, &splits);                                                                 // <-- csv indices; low-adjacent to offending line, in other words [i, i+1] encapsulates the evil gap
 
-    println!();
+    println!("\n");
 
     csw.write_record(mode.header())?;
 
@@ -593,7 +609,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\nOK\n");
-    tea_break(&var, Some(&mode), Some((&mode, dataset.parse().unwrap())));
+    tea_break(&var, Some(&mode), Some((&mode, dataset)));
     Ok(())
 }
 
@@ -775,6 +791,19 @@ pub fn stringify_all<T: ToString>(items: &Vec<T>) -> Vec<String> {
     items.iter().map(|x| x.to_string()).collect()
 }
 
+/// Attempt to identify dataset type.
+pub fn id_dstype(uri: &str) -> Option<DSType> {
+    let (mut reader, mut buf) = (BufReader::new(File::open(uri).expect("Could not open dataset")), String::new());
+    reader.read_line(&mut buf).expect("Could not read dataset header"); // skip header.
+    reader.read_line(&mut buf).expect("Could not read dataset line"); // actual line to check!
+
+    // TODO irgex check this and return None if invalid
+    match buf {
+        b if b.contains("/") => Some(DSType::Type1),
+        _ => Some(DSType::Type2),
+    }
+}
+
 /// Send contents to clipboard.
 fn to_clipboard(contents: &str) {
     let mut pbcopy = Command::new("pbcopy")
@@ -820,14 +849,17 @@ fn tea_break(var: &str, hl: Option<&DclxMode>, mark: Option<(&DclxMode, u8)>) {
         println!("║ {: <5}{}║", i, DclxMode::iter()
             .map(|d| format!("{}      ",
                             match d {
-                                d if mark.as_ref().is_some_and(|(mode, ind)| d == **mode && i == *ind) => '▓', // Extra highlight; skip file check if newly made file.
+                                d if mark.as_ref().is_some_and(|(mode, ind)| d == **mode && i == *ind) => '▓',                                     // Extra highlight; skip file check if newly made file.
 
-                                _ if fs::exists(format!("{}/{:03}/{}_{:03}_{}.csv", DATA_PATH, i, var, i, d.suffix()))   // Norm highlight; checks if file exists.
+                                _ if fs::exists(format!("{}/{:03}/{}_{:03}_{}.csv", DATA_PATH, i, var, i, d.suffix()))                                         // Norm highlight; checks if file exists.
                                  .expect("Failed to query file") => '▒',
 
-                                d if hl.as_ref().is_some_and(|mode| d == **mode) => '*',                             // Extra dot; in selected mode column.
+                                d if id_dstype(&format!("{}/{:03}/{}_{:03}.csv", DATA_PATH, i, var, i)).is_some_and(|h|
+                                    (d == DclxMode::FixT1) ^ (h == DSType::Type1)) => 'x',    // Warning; wrong DSType for operation.
 
-                                _ => '.'                                                                                       // Norm dot; N/A.
+                                d if hl.as_ref().is_some_and(|mode| d == **mode) => '*',                                                                 // Extra dot; in selected mode column.
+
+                                _ => '.'                                                                                                                            // Norm dot; N/A.
 
                             }
             )).fold(String::new(), |acc, s| acc + &s));
@@ -963,6 +995,14 @@ mod tests {
         let yr = UTime::from_min(5,2,28,0);
        // let ut = UTime::from_unix(1577880000);
         println!("{}", yr.to_unix())
+    }
+
+    #[test]
+    fn utime_hrt() {
+        let (ut1, ut2) = (UTime::from_hr("2020-02-27 19:01:17"), UTime::from_hr("2020-02-27 18:20:42"));
+        let diff = ut1.diff(&ut2).unwrap();
+
+        println!("{}\n{}\n{}", diff.to_unix(), diff.to_prt(), diff.to_hrt());
     }
 }
 
